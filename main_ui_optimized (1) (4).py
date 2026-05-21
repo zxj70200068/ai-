@@ -6,6 +6,7 @@ import os
 import csv
 import re
 import threading
+import queue
 import traceback
 import urllib.request
 import urllib.error
@@ -1502,6 +1503,81 @@ class PhysicsSimulationEngine:
                 "error": f"calc_env_disturbance 异常：{type(exc).__name__}",
             }
 
+    # ──────────────────────── 聚合入口 ────────────────────────
+    def simulate_all(self, cooling_load_kw, supply_temp_c, zone_loads,
+                     vrf_load_kw, t_out=32.0, hour=12.0,
+                     building_area_m2=12000.0, window_ratio=0.65,
+                     cloud_cover=0.0):
+        """聚合入口：一次性串联水侧 / 风侧 / VRF / 环境扰动 4 类过程量反算，
+        返回一个扁平化 dict（核心物理量暴露在顶层 key，原子状态保留在 _water/_air/_vrf/_env）。
+
+        设计意图：
+            主循环 (WhiteBoxEngine.execute_step) 仅需一行调用本方法即可获得整套物理
+            过程视图，避免把 4 个 calc_* 的调用逻辑和中间拼装散落到主控类。
+
+        参数：
+            cooling_load_kw   (float): 当前水冷系统总冷量需求 kW（公共区，已过寻优分配）
+            supply_temp_c     (float): 冷冻水供水温度 ℃
+            zone_loads        (dict) : {区名: 冷负荷 kW}（用于 VAV 反算）
+            vrf_load_kw       (float): 多联机当前冷量需求 kW
+            t_out             (float): 室外干球温度 ℃
+            hour              (float): 当前小时 0~24
+            building_area_m2  (float): 建筑总面积 m²
+            window_ratio      (float): 窗墙比 [0,1]
+            cloud_cover       (float): 云量遮蔽率 [0,1]
+        返回：
+            dict — 扁平化过程量视图。
+        """
+        try:
+            water = self.calc_water_side(cooling_load_kw, supply_temp_c)
+            air   = self.calc_air_side(zone_loads or {})
+            vrf   = self.calc_vrf_side(vrf_load_kw)
+            env   = self.calc_env_disturbance(
+                t_out=t_out, hour=hour,
+                building_area_m2=building_area_m2,
+                window_ratio=window_ratio,
+                cloud_cover=cloud_cover,
+            )
+            return {
+                # —— 用户硬性指定的 4 个核心物理量 ——
+                "pump_freq_hz":            water.get("pump_freq_hz"),
+                "duct_static_pressure_pa": air.get("duct_static_pressure_pa"),
+                "exv_opening_pct":         vrf.get("exv_opening_pct"),
+                "worst_loop_dp_kpa":       water.get("worst_loop_dp_kpa"),
+                # —— 水侧扩展 ——
+                "chw_flow_m3h":            water.get("flow_m3h"),
+                "valve_opening_avg_pct":   water.get("valve_opening_avg_pct"),
+                "pump_head_m":             water.get("pump_head_m"),
+                "chw_supply_temp_c":       water.get("supply_temp_c"),
+                "chw_return_temp_c":       water.get("return_temp_c"),
+                # —— 风侧扩展 ——
+                "total_air_flow_m3h":      air.get("total_air_flow_m3h"),
+                "fan_freq_hz":             air.get("fan_freq_hz"),
+                "vav_openings_pct":        air.get("vav_openings_pct"),
+                # —— VRF 扩展 ——
+                "refrigerant_mass_flow_kgh": vrf.get("refrigerant_mass_flow_kgh"),
+                "evap_temp_c":             vrf.get("evap_temp_c"),
+                "vrf_plr":                 vrf.get("plr_ratio"),
+                # —— 环境扰动扩展 ——
+                "solar_irradiance_wm2":    env.get("solar_irradiance_wm2"),
+                "disturbance_load_kw":     env.get("disturbance_load_kw"),
+                "outdoor_temp_c":          env.get("outdoor_temp_c"),
+                "solar_constant_wm2":      env.get("solar_constant_wm2"),
+                # —— 完整子状态（供详情面板/日志可选消费）——
+                "_water": water,
+                "_air":   air,
+                "_vrf":   vrf,
+                "_env":   env,
+            }
+        except Exception as exc:
+            return {
+                "error": f"simulate_all 异常：{type(exc).__name__}: {exc}",
+                "pump_freq_hz": 0.0,
+                "duct_static_pressure_pa": 0.0,
+                "exv_opening_pct": 0.0,
+                "worst_loop_dp_kpa": 0.0,
+            }
+
 
 # =====================================================================
 # 4. 物理模型与安全控制引擎
@@ -1850,6 +1926,8 @@ class WhiteBoxEngine:
         self.load_building(building_key)
         self._is_silent = False
         self.reset_state(full=True)
+        # 由 MainPlatformGUI 在实例化后注入，用于将物理过程帧跨线程推送给 UI 主线程
+        self.ui_reference = None
 
     def _build_registry(self):
         t_out_arr = np.array(self.sys_config['cop_tables']['T_out'])
@@ -2415,6 +2493,50 @@ class WhiteBoxEngine:
         if not ai_info and strategy:
             ai_info = strategy.get_last_info()
 
+        # ─────── 【新增】物理过程量反算 + 跨线程推送给 UI 主线程 ───────
+        # 设计意图：
+        #   决策（strategy.decide_mode + chiller_optimizer.optimize）已完成，
+        #   各侧负荷分配已就绪；在汇总返回上层前，调用 PhysicsSimulationEngine.simulate_all
+        #   一次性获得 4 类过程量，并通过 queue.Queue 投递到 GUI 主线程，
+        #   使全天时序仿真期间界面能"边跑边刷"。
+        physics_state = None
+        try:
+            ui_ref = getattr(self, "ui_reference", None)
+            if ui_ref is not None and getattr(ui_ref, "physics_engine", None) is not None:
+                # 安全读取配置：即使配置字典缺层级也不抛 KeyError
+                _eq = self.sys_config.get('equipment', {}) if isinstance(self.sys_config, dict) else {}
+                _env_cfg = self.sys_config.get('envelope', {}) if isinstance(self.sys_config, dict) else {}
+                _bldg_area = _eq.get('floor_area_m2', 12000)
+                _wwr = _env_cfg.get('window_to_wall_ratio', 0.65)
+                _hour = float(factor.get('hour', 12)) if isinstance(factor, dict) else 12.0
+                _chw_supply = hydraulic_info.get("supply_temp_c", 7.0) \
+                    if isinstance(hydraulic_info, dict) else 7.0
+
+                physics_state = ui_ref.physics_engine.simulate_all(
+                    cooling_load_kw=q_public,
+                    supply_temp_c=_chw_supply,
+                    zone_loads=zone_loads_dyn,
+                    vrf_load_kw=q_private,
+                    t_out=t_out,
+                    hour=_hour,
+                    building_area_m2=_bldg_area,
+                    window_ratio=_wwr,
+                )
+                physics_state["sim_time_min"] = self.sim_time
+                physics_state["mode"] = self.current_mode
+
+                # queue.Queue 是线程安全的，put_nowait 在无界队列上不会阻塞
+                try:
+                    ui_ref.physics_queue.put_nowait(physics_state)
+                except Exception:
+                    pass
+        except Exception as _exc:
+            try:
+                self.log_event("物理过程反算异常", f"{type(_exc).__name__}: {_exc}")
+            except Exception:
+                pass
+        # ────────────────────────────────────────────────────────────
+
         return {
             "time": self.sim_time, "dt": dt,
             "load": round(q_required, 2), "delivered": round(q_delivered, 2), "target": round(target_load, 2),
@@ -2435,7 +2557,8 @@ class WhiteBoxEngine:
             "hydraulic": hydraulic_info,
             "chiller_status": chiller_status,
             "sys_safety_cfg": self.sys_config['safety'],
-            "mode_before": mode_before
+            "mode_before": mode_before,
+            "physics_state": physics_state
         }
 
     def _frozen_state(self, ai_info=None):
@@ -3130,10 +3253,80 @@ class MainPlatformGUI:
         self.history_logger = HistoryLogger()
         self.config_manager = ConfigManager()
         self.engine = WhiteBoxEngine(self.config_manager, list(self.config_manager.building_configs.keys())[0])
+        # ─────── 【新增】物理过程量在线展示通道（线程安全） ───────
+        # PhysicsSimulationEngine 实例 + queue.Queue 跨线程通道；engine 通过
+        # ui_reference.physics_queue.put() 推送，本类主线程通过 process_physics_queue
+        # 周期抽干并刷新 UI（Treeview/控制台），仅主线程触碰 Tk。
+        self.physics_engine = PhysicsSimulationEngine()
+        self.physics_queue = queue.Queue()
+        # 反向注入：让 engine 在 execute_step 末尾能拿到本 UI 的队列
+        self.engine.ui_reference = self
+        # ────────────────────────────────────────────────────────
         self.agent = AIReportAgent()
         self.sim_runner = SimulationRunner(self.engine)
         self._build_ui()
         self.show_welcome_info()
+        # 启动主线程轮询（100ms），由 process_physics_queue 抽干 physics_queue 并刷新 UI
+        self.root.after(100, self.process_physics_queue)
+
+    def process_physics_queue(self):
+        """主线程定时轮询：从 self.physics_queue 抽干所有积压帧，仅渲染最新一帧。
+
+        为什么这样做：
+            run_sequence_async 中的 worker 子线程会高频调用 WhiteBoxEngine.execute_step，
+            每步都会向 physics_queue 推一帧物理过程量；本方法在 Tk 主线程被
+            self.root.after(100, ...) 周期性触发，避免子线程直接操作 Tk 控件。
+        """
+        try:
+            latest = None
+            while True:
+                try:
+                    latest = self.physics_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if latest is not None:
+                self._render_physics_state(latest)
+        except Exception as exc:
+            try:
+                log_error("MainPlatformGUI.process_physics_queue", exc)
+            except Exception:
+                pass
+        finally:
+            # 不论本次是否取到帧，都重新挂下一次轮询
+            try:
+                self.root.after(100, self.process_physics_queue)
+            except Exception:
+                pass
+
+    def _render_physics_state(self, state):
+        """把一帧物理过程量渲染到 UI（必须在主线程调用）。
+
+        当前实现：写入控制台日志（self.out 已存在）；后续可扩展为 Treeview / 仪表盘。
+        若仓库后续新增 self.tv_physics 等控件，可在此方法补 .insert / .set 即可，
+        无需改动队列与轮询基础设施。
+        """
+        if not isinstance(state, dict):
+            return
+        try:
+            line = (
+                "[物理过程] t={t}min 模式={m} | "
+                "水泵={pf}Hz 风管余压={dp}Pa EXV={exv}% 最不利环路Δp={wdp}kPa | "
+                "冷冻水流量={fw}m³/h 总送风={fa}m³/h 室外={tout}℃"
+            ).format(
+                t=state.get('sim_time_min', '-'),
+                m=state.get('mode', '-'),
+                pf=state.get('pump_freq_hz', '-'),
+                dp=state.get('duct_static_pressure_pa', '-'),
+                exv=state.get('exv_opening_pct', '-'),
+                wdp=state.get('worst_loop_dp_kpa', '-'),
+                fw=state.get('chw_flow_m3h', '-'),
+                fa=state.get('total_air_flow_m3h', '-'),
+                tout=state.get('outdoor_temp_c', '-'),
+            )
+            if hasattr(self, 'out'):
+                self.out(line, clear=False)
+        except Exception:
+            pass
 
     def _build_ui(self):
         """构建更清晰的分区式界面：数据、工况、运行、分析、导出分组，避免按钮横向堆叠。"""
