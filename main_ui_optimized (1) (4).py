@@ -333,6 +333,16 @@ class HistoryLogger:
     支撑 t+1 冷负荷预测与调度策略的持续闭环优化；当云端推理通道异常时，本地策略
     （MPCStrategy/RuleBasedStrategy）按既有降级逻辑接管，CSV 写盘流程保持不变。
     每行对应一个仿真步长，列数与列序固定，确保下游训练管线零侵入消费。
+
+    schema 演进记录
+    --------------
+    v1.0 ：原 40 列。
+    v1.1 ：在 v1.0 末尾追加 12 列物理过程量（PhysicsSimulationEngine.simulate_all 输出）：
+           solar_irradiance_wm2 / worst_loop_dp_kpa / vav_opening_avg_pct / vav_openings_json /
+           exv_opening_pct / duct_static_pressure_pa / fan_freq_hz / total_air_flow_m3h /
+           disturbance_load_kw / evap_temp_c / refrigerant_mass_flow_kgh / chw_supply_temp_c。
+           前 40 列的列名与列序与 v1.0 完全一致，下游按列序读前 40 列保持向后兼容；
+           读取 v1.1 数据时，老 v1.0 的 CSV 会被自动备份为 <原名>.v10.bak，新文件按 v1.1 写入。
     """
     def __init__(self, file_path="history_log.csv"):
         self.file_path = file_path
@@ -349,13 +359,50 @@ class HistoryLogger:
             "chiller_units", "chiller_plr_percent", "chiller_cop", "chiller_power_kw",
             "vrf_power_kw", "pump_power_kw", "chilled_water_flow_m3h",
             "pump_head_kpa", "pump_freq_hz", "transformer_load_percent",
-            "alarms", "safety_override", "lcc_kwh_saved", "lcc_cost_saved"
+            "alarms", "safety_override", "lcc_kwh_saved", "lcc_cost_saved",
+            # ── v1.1 新增：物理过程量（PhysicsSimulationEngine.simulate_all 输出） ──
+            "solar_irradiance_wm2",        # Solar_Rad
+            "worst_loop_dp_kpa",           # Loop_DP
+            "vav_opening_avg_pct",         # VAV_Opening 平均
+            "vav_openings_json",           # VAV_Opening 各区明细（JSON 字符串）
+            "exv_opening_pct",             # EXV_Opening
+            "duct_static_pressure_pa",     # 主风管余压
+            "fan_freq_hz",                 # 风机频率
+            "total_air_flow_m3h",          # 总送风量
+            "disturbance_load_kw",         # 环境扰动等效冷负荷
+            "evap_temp_c",                 # 蒸发温度
+            "refrigerant_mass_flow_kgh",   # 制冷剂质量流量
+            "chw_supply_temp_c",           # 冷冻水供水温度（与 hyd 不同源，物理引擎反算）
         ]
+        # 文件不存在 → 直接写新表头
         if not os.path.exists(self.file_path):
             try:
                 with open(self.file_path, "w", newline="", encoding="utf-8-sig") as f:
                     writer = csv.writer(f)
                     writer.writerow(self.headers)
+            except Exception:
+                pass
+        else:
+            # 文件已存在 → 检查首行列数；若小于当前 headers 长度，
+            # 视为旧 schema (v1.0)，将旧文件改名备份，再写入新表头。
+            try:
+                with open(self.file_path, "r", encoding="utf-8-sig") as f:
+                    first = f.readline()
+                old_cols = first.count(",") + 1 if first else 0
+                if 0 < old_cols < len(self.headers):
+                    backup_path = self.file_path + ".v10.bak"
+                    try:
+                        if os.path.exists(backup_path):
+                            os.remove(backup_path)
+                    except Exception:
+                        pass
+                    try:
+                        os.rename(self.file_path, backup_path)
+                    except Exception:
+                        pass
+                    with open(self.file_path, "w", newline="", encoding="utf-8-sig") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(self.headers)
             except Exception:
                 pass
 
@@ -384,9 +431,27 @@ class HistoryLogger:
             hyd = res.get("hydraulic", {})
             chiller_status = res.get("chiller_status", {})
 
+            # v1.1 新增：从 res 中提取物理过程量（PhysicsSimulationEngine 反算结果）
+            physics = res.get("physics_state") or {}
+            if not isinstance(physics, dict):
+                physics = {}
+            vav_dict = physics.get("vav_openings_pct") or {}
+            if isinstance(vav_dict, dict) and vav_dict:
+                try:
+                    vav_avg_pct = round(sum(float(v) for v in vav_dict.values()) / len(vav_dict), 2)
+                except Exception:
+                    vav_avg_pct = ""
+                try:
+                    vav_openings_json = json.dumps(vav_dict, ensure_ascii=False)
+                except Exception:
+                    vav_openings_json = "{}"
+            else:
+                vav_avg_pct = ""
+                vav_openings_json = "{}"
+
             # 严格按 headers 顺序构建 row，共 40 列（首列 schema_version 标注数据格式版本）
             row = [
-                "1.0",                                                       # schema_version
+                "1.1",                                                       # schema_version
                 ts,                                                          # timestamp
                 building_name,                                               # building_name
                 scenario_name,                                               # scenario_name
@@ -425,7 +490,20 @@ class HistoryLogger:
                 " | ".join(res.get("cmd", {}).get("alarms", [])),            # alarms
                 res.get("safety_override", False),                           # safety_override
                 res.get("total_kwh_saved", 0),                               # lcc_kwh_saved
-                res.get("total_cost_saved", 0)                               # lcc_cost_saved
+                res.get("total_cost_saved", 0),                              # lcc_cost_saved
+                # ── v1.1 物理过程量（来自 res["physics_state"] 扁平字典）──
+                physics.get("solar_irradiance_wm2", ""),
+                physics.get("worst_loop_dp_kpa", ""),
+                vav_avg_pct,
+                vav_openings_json,
+                physics.get("exv_opening_pct", ""),
+                physics.get("duct_static_pressure_pa", ""),
+                physics.get("fan_freq_hz", ""),
+                physics.get("total_air_flow_m3h", ""),
+                physics.get("disturbance_load_kw", ""),
+                physics.get("evap_temp_c", ""),
+                physics.get("refrigerant_mass_flow_kgh", ""),
+                physics.get("chw_supply_temp_c", ""),
             ]
             with open(self.file_path, "a", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
@@ -3325,8 +3403,111 @@ class MainPlatformGUI:
             )
             if hasattr(self, 'out'):
                 self.out(line, clear=False)
+            # 同步刷新机理监控 Treeview
+            try:
+                self.update_physics_ui(state)
+            except Exception:
+                pass
         except Exception:
             pass
+
+    def update_physics_ui(self, state):
+        """主线程刷新"系统流体力学与热力学过程"Treeview。
+
+        线程模型：
+            本方法仅由 process_physics_queue（self.root.after 注册的主线程定时器）触发，
+            所有 Tk 操作在主线程完成；子线程仅通过 self.physics_queue.put_nowait(...) 推数。
+
+        行序：
+            按"沿管流"逻辑组织 —— 水侧从冷源出水 → 干管流量 → 水泵 → 末端 → 最不利环路压差 → 回水；
+            风侧从风机 → 总送风 → 风管余压 → VAV 开度（平均/各区）；
+            VRF 段从制冷剂质量流量 → 蒸发温度 → EXV 开度 → PLR；
+            环境段：太阳辐射常数（基准）→ 实际辐照度 → 室外温度 → 等效扰动冷负荷。
+        """
+        if not hasattr(self, "tv_physics") or self.tv_physics is None:
+            return
+        if not isinstance(state, dict):
+            return
+        try:
+            # 清空旧行
+            for item in self.tv_physics.get_children():
+                self.tv_physics.delete(item)
+
+            def _fmt(v, nd=2):
+                if v is None or v == "":
+                    return "--"
+                try:
+                    return f"{float(v):.{nd}f}"
+                except Exception:
+                    return str(v)
+
+            # ── 水侧（沿管流：冷源出水 → 总流量 → 水泵 → 末端阀位 → 最不利环路Δp → 回水）──
+            water_rows = [
+                ("冷机出水（供水）",  "供水温度",       _fmt(state.get("chw_supply_temp_c"), 2), "℃"),
+                ("冷冻水干管",        "供水总流量",     _fmt(state.get("chw_flow_m3h"),       1), "m³/h"),
+                ("变频水泵",          "运行频率",       _fmt(state.get("pump_freq_hz"),       2), "Hz"),
+                ("变频水泵",          "扬程",           _fmt(state.get("pump_head_m"),        2), "m"),
+                ("末端二通阀",        "平均阀位",       _fmt(state.get("valve_opening_avg_pct"), 1), "%"),
+                ("最不利环路",        "压差 Δp",        _fmt(state.get("worst_loop_dp_kpa"),  2), "kPa"),
+                ("冷机回水",          "回水温度",       _fmt(state.get("chw_return_temp_c"),  2), "℃"),
+            ]
+            for node, param, val, unit in water_rows:
+                tags = ("water",)
+                # 用户明确点名的 4 个核心物理量加 highlight
+                if param in ("运行频率", "压差 Δp"):
+                    tags = ("water", "highlight")
+                self.tv_physics.insert("", "end",
+                    values=("水侧（CHW）", node, param, val, unit), tags=tags)
+
+            # ── 风侧 ──
+            air_rows = [
+                ("送风机",            "运行频率",       _fmt(state.get("fan_freq_hz"),             2), "Hz"),
+                ("空调主风管",        "总送风量",       _fmt(state.get("total_air_flow_m3h"),      1), "m³/h"),
+                ("空调主风管",        "余压",           _fmt(state.get("duct_static_pressure_pa"), 1), "Pa"),
+            ]
+            for node, param, val, unit in air_rows:
+                tags = ("air",)
+                if param == "余压":
+                    tags = ("air", "highlight")
+                self.tv_physics.insert("", "end",
+                    values=("风侧（VAV）", node, param, val, unit), tags=tags)
+            # 各区 VAV 开度（动态展开）
+            vav_dict = state.get("vav_openings_pct") or {}
+            if isinstance(vav_dict, dict):
+                for zk, zv in vav_dict.items():
+                    self.tv_physics.insert("", "end",
+                        values=("风侧（VAV）", f"VAV-{zk}", "阀位开度", _fmt(zv, 1), "%"),
+                        tags=("air",))
+
+            # ── VRF（多联机） ──
+            vrf_rows = [
+                ("EXV 电子膨胀阀",    "开度",           _fmt(state.get("exv_opening_pct"),          1), "%"),
+                ("R410A 制冷剂",      "质量流量",       _fmt(state.get("refrigerant_mass_flow_kgh"), 2), "kg/h"),
+                ("蒸发器",            "蒸发温度",       _fmt(state.get("evap_temp_c"),              2), "℃"),
+                ("VRF 主机",          "PLR",            _fmt(state.get("vrf_plr"),                  3), "-"),
+            ]
+            for node, param, val, unit in vrf_rows:
+                tags = ("vrf",)
+                if param == "开度":
+                    tags = ("vrf", "highlight")
+                self.tv_physics.insert("", "end",
+                    values=("多联机（VRF）", node, param, val, unit), tags=tags)
+
+            # ── 环境扰动 ──
+            env_rows = [
+                ("太阳常数（基准）",  "I₀",             _fmt(state.get("solar_constant_wm2"),    1), "W/m²"),
+                ("落地辐照度",        "G",              _fmt(state.get("solar_irradiance_wm2"),  1), "W/m²"),
+                ("室外干球",          "T_out",          _fmt(state.get("outdoor_temp_c"),        2), "℃"),
+                ("等效扰动",          "Q_disturb",      _fmt(state.get("disturbance_load_kw"),   2), "kW"),
+            ]
+            for node, param, val, unit in env_rows:
+                self.tv_physics.insert("", "end",
+                    values=("环境扰动", node, param, val, unit), tags=("env",))
+        except Exception as exc:
+            try:
+                log_error("MainPlatformGUI.update_physics_ui", exc)
+            except Exception:
+                pass
 
     def _build_ui(self):
         """构建更清晰的分区式界面：数据、工况、运行、分析、导出分组，避免按钮横向堆叠。"""
@@ -3516,6 +3697,30 @@ class MainPlatformGUI:
         self.fr_hyd.grid_rowconfigure(0, weight=1)
         self.fr_hyd.grid_columnconfigure(0, weight=1)
         paned.add(self.fr_hyd, minsize=150)
+
+        # ─────── ⑦ 系统流体力学与热力学过程（机理监控面板） ───────
+        # 实时展示 PhysicsSimulationEngine.simulate_all 反算的水/风/VRF/环境过程量，
+        # 行序按"沿管流"顺序排布：冷源 → 干管 → 末端 → 回水 / 风源 → 干管 → 末端 / VRF / 环境。
+        fr_physics = ttk.LabelFrame(paned, text=" ⑦ 系统流体力学与热力学过程 ")
+
+        cols_phy = ("子系统", "节点", "参数", "数值", "单位")
+        self.tv_physics = ttk.Treeview(fr_physics, columns=cols_phy, show="headings", height=14)
+        for col, w in zip(cols_phy, (110, 240, 110, 130, 70)):
+            self.tv_physics.heading(col, text=col)
+            self.tv_physics.column(col, width=w, anchor="center")
+        # 颜色 tag：每个子系统一个底色，便于区分管路段
+        self.tv_physics.tag_configure("water", background="#E6F4FF")  # 水侧浅蓝
+        self.tv_physics.tag_configure("air",   background="#F0FFE6")  # 风侧浅绿
+        self.tv_physics.tag_configure("vrf",   background="#FFF7E6")  # VRF 浅橙
+        self.tv_physics.tag_configure("env",   background="#F5F0FF")  # 环境浅紫
+        self.tv_physics.tag_configure("highlight", foreground="#B22222", font=("微软雅黑", 9, "bold"))
+        # 滚动条
+        sb_phy = ttk.Scrollbar(fr_physics, orient="vertical", command=self.tv_physics.yview)
+        self.tv_physics.configure(yscrollcommand=sb_phy.set)
+        self.tv_physics.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+        sb_phy.pack(side="right", fill="y", padx=(0, 4), pady=4)
+        paned.add(fr_physics, minsize=200)
+        # ─────────────────────────────────────────────────────────
 
         fr_out = ttk.LabelFrame(paned, text=" 运行报告 / 控制台输出 ")
         self.txt_out = scrolledtext.ScrolledText(fr_out, font=("Consolas", 10), bg="#0F172A", fg="#A7F3D0", insertbackground="white", height=12)
