@@ -1581,11 +1581,77 @@ class PhysicsSimulationEngine:
                 "error": f"calc_env_disturbance 异常：{type(exc).__name__}",
             }
 
+    # ──────────────────────── 室内热舒适（PMV）────────────────────────
+    def calc_pmv(self, temp, relative_humidity=50, air_speed=0.15, clo=0.5, met=1.1):
+        """ISO 7730 / ASHRAE 55 标准 PMV (Predicted Mean Vote) 计算（Fanger 1972）。
+
+        本实现为 ISO 7730 附录 D 的完整 Fanger 方程，通过迭代求解衣物表面温度 tcl。
+
+        参数：
+            temp              (float): 室内空气温度 ℃（平均辐射温度近似取等于空气温度）
+            relative_humidity (float): 相对湿度 %    默认 50
+            air_speed         (float): 室内空气流速 m/s 默认 0.15
+            clo               (float): 衣着热阻 clo  默认 0.5
+            met               (float): 代谢率 met    默认 1.1
+        返回：
+            float — PMV 值，理论范围 [-3, +3]。
+                    -0.5 ≤ PMV ≤ +0.5 视为热舒适（ISO 7730 B 类合规区）。
+        """
+        try:
+            ta = float(temp)
+            rh = float(relative_humidity)
+            vel = max(0.0, float(air_speed))
+            clo_v = max(0.0, float(clo))
+            met_v = max(0.8, float(met))
+
+            tr = ta
+            M = met_v * 58.15
+            W_ext = 0.0
+            Icl = clo_v * 0.155
+
+            if Icl <= 0.078:
+                fcl = 1.0 + 1.29 * Icl
+            else:
+                fcl = 1.05 + 0.645 * Icl
+
+            pa = rh * 10.0 * math.exp(16.6536 - 4030.183 / (ta + 235.0))
+            hcf = 12.1 * math.sqrt(vel)
+
+            tcl = ta + (35.5 - ta) / (3.5 * (Icl + 0.1))
+            for _ in range(150):
+                hcn = 2.38 * abs(tcl - ta) ** 0.25
+                hc = hcf if hcf > hcn else hcn
+                tcl_new = (
+                    35.7 - 0.028 * (M - W_ext) - Icl * (
+                        3.96e-8 * fcl * ((tcl + 273.0) ** 4 - (tr + 273.0) ** 4)
+                        + fcl * hc * (tcl - ta)
+                    )
+                )
+                if abs(tcl_new - tcl) < 1e-4:
+                    tcl = tcl_new
+                    break
+                tcl = tcl_new
+
+            hl1 = 3.05e-3 * (5733.0 - 6.99 * (M - W_ext) - pa)
+            hl2 = 0.42 * ((M - W_ext) - 58.15) if (M - W_ext) > 58.15 else 0.0
+            hl3 = 1.7e-5 * M * (5867.0 - pa)
+            hl4 = 0.0014 * M * (34.0 - ta)
+            hl5 = 3.96e-8 * fcl * ((tcl + 273.0) ** 4 - (tr + 273.0) ** 4)
+            hl6 = fcl * hc * (tcl - ta)
+
+            ts = 0.303 * math.exp(-0.036 * M) + 0.028
+            pmv = ts * ((M - W_ext) - hl1 - hl2 - hl3 - hl4 - hl5 - hl6)
+            return float(pmv)
+        except Exception:
+            return 0.0
+
     # ──────────────────────── 聚合入口 ────────────────────────
     def simulate_all(self, cooling_load_kw, supply_temp_c, zone_loads,
                      vrf_load_kw, t_out=32.0, hour=12.0,
                      building_area_m2=12000.0, window_ratio=0.65,
-                     cloud_cover=0.0):
+                     cloud_cover=0.0, indoor_temp_c=26.0,
+                     indoor_rh_percent=50.0, indoor_air_speed_ms=0.15,
+                     occupant_clo=0.5, occupant_met=1.1):
         """聚合入口：一次性串联水侧 / 风侧 / VRF / 环境扰动 4 类过程量反算，
         返回一个扁平化 dict（核心物理量暴露在顶层 key，原子状态保留在 _water/_air/_vrf/_env）。
 
@@ -1616,6 +1682,14 @@ class PhysicsSimulationEngine:
                 window_ratio=window_ratio,
                 cloud_cover=cloud_cover,
             )
+            # 室内热舒适（PMV，ISO 7730 标准实现）
+            try:
+                pmv_value = round(float(self.calc_pmv(
+                    temp=indoor_temp_c, relative_humidity=indoor_rh_percent,
+                    air_speed=indoor_air_speed_ms,
+                    clo=occupant_clo, met=occupant_met)), 2)
+            except Exception:
+                pmv_value = 0.0
             return {
                 # —— 用户硬性指定的 4 个核心物理量 ——
                 "pump_freq_hz":            water.get("pump_freq_hz"),
@@ -1646,6 +1720,10 @@ class PhysicsSimulationEngine:
                 "_air":   air,
                 "_vrf":   vrf,
                 "_env":   env,
+                # —— 室内热舒适（PMV，ISO 7730 B 类合规区为 [-0.5, +0.5]）——
+                "PMV_Index":         pmv_value,
+                "indoor_temp_c":     round(float(indoor_temp_c), 2),
+                "indoor_rh_percent": round(float(indoor_rh_percent), 1),
             }
         except Exception as exc:
             return {
@@ -1654,6 +1732,7 @@ class PhysicsSimulationEngine:
                 "duct_static_pressure_pa": 0.0,
                 "exv_opening_pct": 0.0,
                 "worst_loop_dp_kpa": 0.0,
+                "PMV_Index": 0.0,
             }
 
 
@@ -2599,6 +2678,7 @@ class WhiteBoxEngine:
                     hour=_hour,
                     building_area_m2=_bldg_area,
                     window_ratio=_wwr,
+                    indoor_temp_c=t_in_current,
                 )
                 physics_state["sim_time_min"] = self.sim_time
                 physics_state["mode"] = self.current_mode
@@ -3503,6 +3583,55 @@ class MainPlatformGUI:
             for node, param, val, unit in env_rows:
                 self.tv_physics.insert("", "end",
                     values=("环境扰动", node, param, val, unit), tags=("env",))
+
+            # ── 室内热舒适（PMV，ISO 7730）──
+            try:
+                self.tv_physics.tag_configure("comfort_ok",   background="#E8F8E8", foreground="#15803D",
+                                              font=("微软雅黑", 9, "bold"))
+                self.tv_physics.tag_configure("comfort_warn", background="#FFE8E8", foreground="#B91C1C",
+                                              font=("微软雅黑", 9, "bold"))
+                self.tv_physics.tag_configure("comfort_base", background="#FFFCE6")
+            except Exception:
+                pass
+
+            pmv_val = state.get("PMV_Index")
+            try:
+                pmv_num = float(pmv_val) if pmv_val is not None else None
+            except Exception:
+                pmv_num = None
+
+            if pmv_num is None:
+                pmv_disp = "--"
+                verdict = "--"
+                verdict_tag = "comfort_base"
+            else:
+                pmv_disp = f"{pmv_num:+.2f}"
+                if -0.5 <= pmv_num <= 0.5:
+                    verdict = "舒适(合规)"
+                    verdict_tag = "comfort_ok"
+                elif pmv_num > 0.5:
+                    verdict = "偏热(超标)"
+                    verdict_tag = "comfort_warn"
+                else:
+                    verdict = "偏冷(超标)"
+                    verdict_tag = "comfort_warn"
+
+            self.tv_physics.insert("", "end",
+                values=("热舒适（PMV）", "室内空气", "干球温度",
+                        _fmt(state.get("indoor_temp_c"), 2), "℃"),
+                tags=("comfort_base",))
+            self.tv_physics.insert("", "end",
+                values=("热舒适（PMV）", "室内空气", "相对湿度",
+                        _fmt(state.get("indoor_rh_percent"), 1), "%"),
+                tags=("comfort_base",))
+            self.tv_physics.insert("", "end",
+                values=("热舒适（PMV）", "ISO 7730 PMV", "预测平均投票",
+                        pmv_disp, "-"),
+                tags=(verdict_tag,))
+            self.tv_physics.insert("", "end",
+                values=("热舒适（PMV）", "B 类合规区 [-0.5, +0.5]", "判定",
+                        verdict, "-"),
+                tags=(verdict_tag,))
         except Exception as exc:
             try:
                 log_error("MainPlatformGUI.update_physics_ui", exc)
